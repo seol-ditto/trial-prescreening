@@ -23,41 +23,65 @@ STATUS_COLOR = {"적격": "🟢", "보류": "🟡", "부적격": "⚪"}
 CHECK_COLOR = {"충족": "🟢", "위반": "🔴", "불확실": "🟡"}
 
 # ----------------------------------------------------------------------
-# 엑셀 업로드용 컬럼 매핑 (의무기록팀/PHIS에서 받은 엑셀을 이 템플릿 형식으로 정리해서 올린다고 가정)
+# 엑셀 업로드용 컬럼 매핑
+# 실제 워크플로우: "외래예약 환자 리스트"(PHIS, 환자번호+인적사항)와
+# "검사수치 리스트"(의무기록팀에 요청, 환자번호+검사결과)가 서로 다른 엑셀로 따로 나옴.
+# 두 파일을 각각 업로드하면 "환자번호" 기준으로 자동 매칭(join)해서 하나로 합친다.
 # ----------------------------------------------------------------------
-EXCEL_COLUMN_MAP = {
-    "환자ID": "patient_id",
+APPT_COLUMN_MAP = {  # 외래예약 환자 리스트
+    "환자번호": "patient_id",
     "나이": "age",
     "성별": "sex",
     "NYHA": "nyha_class",
     "GDMT복용주수": "gdmt_weeks",
+    "임신수유여부": "pregnancy",
+}
+
+LABS_COLUMN_MAP = {  # 검사수치 리스트 (의무기록팀 제공)
+    "환자번호": "patient_id",
     "ECHO소견": "echo_report",
     "EKG소견": "ekg_finding",
     "최근MI뇌졸중": "recent_mi_stroke",
     "판막질환": "valve_disease",
     "eGFR": "egfr",
-    "임신수유여부": "pregnancy",
     "CRC메모": "crc_note",
 }
 
 
-def make_excel_template() -> bytes:
+def _make_template(column_map: dict, example_row: list) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "환자목록"
-    ws.append(list(EXCEL_COLUMN_MAP.keys()))
-    ws.append([
-        "P001", 68, "남", "III", 8,
-        "2026-08-10 시행. LVEF 32%, 좌심실 확장 소견, 국소벽운동 이상 없음.",
-        "정상 동리듬(NSR), 특이 부정맥 소견 없음.",
-        "없음", "없음", 55, "N/A", "복약순응도 양호. 지난달 ARNI 증량함.",
-    ])
+    ws.append(list(column_map.keys()))
+    ws.append(example_row)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def read_excel_patients(uploaded_file) -> list:
+def make_appointment_template() -> bytes:
+    return _make_template(APPT_COLUMN_MAP, ["12345678", 68, "남", "III", 8, "N/A"])
+
+
+def make_labs_template() -> bytes:
+    return _make_template(LABS_COLUMN_MAP, [
+        "12345678",
+        "2026-08-10 시행. LVEF 32%, 좌심실 확장 소견, 국소벽운동 이상 없음.",
+        "정상 동리듬(NSR), 특이 부정맥 소견 없음.",
+        "없음", "없음", 55, "복약순응도 양호. 지난달 ARNI 증량함.",
+    ])
+
+
+def _normalize_patient_id(val) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, float) and val.is_integer():
+        val = int(val)
+    return str(val).strip()
+
+
+def read_excel_rows(uploaded_file, column_map: dict) -> list:
+    """엑셀을 열어서 column_map(한글 헤더 -> 내부 필드명)에 따라 dict 목록으로 변환."""
     wb = load_workbook(uploaded_file, data_only=True)
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -65,24 +89,35 @@ def read_excel_patients(uploaded_file) -> list:
         raise ValueError("빈 엑셀 파일입니다.")
 
     header = [str(h).strip() if h is not None else "" for h in rows[0]]
-    missing_cols = [c for c in EXCEL_COLUMN_MAP if c not in header]
+    missing_cols = [c for c in column_map if c not in header]
     if missing_cols:
         raise ValueError(f"템플릿에 있는 컬럼이 빠져있습니다: {', '.join(missing_cols)}")
-    col_idx = {c: header.index(c) for c in EXCEL_COLUMN_MAP}
+    col_idx = {c: header.index(c) for c in column_map}
 
-    patients = []
-    for i, row in enumerate(rows[1:], start=1):
+    parsed = []
+    for row in rows[1:]:
         if row is None or all(v is None for v in row):
             continue
         p = {}
-        for kr_col, field in EXCEL_COLUMN_MAP.items():
+        for kr_col, field in column_map.items():
             idx = col_idx[kr_col]
             val = row[idx] if idx < len(row) else None
-            p[field] = "" if val is None else val
-        if not str(p.get("patient_id") or "").strip():
-            p["patient_id"] = f"EXCEL{i:03d}"
-        patients.append(p)
-    return patients
+            p[field] = _normalize_patient_id(val) if field == "patient_id" else ("" if val is None else val)
+        parsed.append(p)
+    return parsed
+
+
+def merge_by_patient_id(*row_lists: list) -> dict:
+    """여러 엑셀에서 읽은 row 목록들을 환자번호(patient_id) 기준으로 병합."""
+    merged = {}
+    for rows in row_lists:
+        for row in rows:
+            pid = row.get("patient_id", "")
+            if not pid:
+                continue
+            merged.setdefault(pid, {"patient_id": pid})
+            merged[pid].update({k: v for k, v in row.items() if k != "patient_id" and v != ""})
+    return merged
 
 
 def extract_pdf_text(uploaded_file) -> str:
@@ -384,20 +419,31 @@ with tab_pdf:
 # 4) 엑셀 일괄 업로드 (의무기록팀/PHIS에서 엑셀로 받은 환자 목록)
 # ------------------------------------------------------------------
 with tab_excel:
-    st.caption("의무기록팀에 요청한 검사결과, PHIS 외래 예약 환자 리스트처럼 엑셀로 받은 자료를 "
-               "아래 템플릿 형식에 맞춰 정리한 뒤 업로드하면 여러 명을 한 번에 판정합니다.")
+    st.caption("PHIS에서 뽑은 **외래예약 환자 리스트**(환자번호·나이·성별 등)와, 의무기록팀에 요청한 "
+               "**검사수치 리스트**(환자번호·ECHO·EKG·eGFR 등) — 실제로 따로 나오는 두 엑셀을 각각 업로드하면, "
+               "**환자번호를 기준으로 자동 매칭**해서 한 번에 일괄 판정합니다. 둘 다 없어도 괜찮고, 하나만 올려도 동작합니다.")
 
-    st.download_button(
-        "📥 엑셀 템플릿 다운로드",
-        data=make_excel_template(),
-        file_name="환자목록_템플릿.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    et1, et2 = st.columns(2)
+    with et1:
+        st.download_button(
+            "📥 외래예약 리스트 템플릿",
+            data=make_appointment_template(),
+            file_name="외래예약_환자리스트_템플릿.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with et2:
+        st.download_button(
+            "📥 검사수치 리스트 템플릿",
+            data=make_labs_template(),
+            file_name="검사수치_리스트_템플릿.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     excel_api_key = st.text_input("Anthropic API Key", type="password", key="excel_api_key")
-    excel_file = st.file_uploader("환자 목록 엑셀 업로드 (.xlsx)", type=["xlsx"], key="excel_uploader")
+    appt_file = st.file_uploader("① 외래예약 환자 리스트 업로드 (.xlsx)", type=["xlsx"], key="appt_uploader")
+    labs_file = st.file_uploader("② 검사수치 리스트 업로드 (.xlsx)", type=["xlsx"], key="labs_uploader")
 
-    if st.button("일괄 AI 판정 실행", key="excel_run_btn", disabled=not excel_file):
+    if st.button("환자번호로 매칭 후 일괄 판정", key="excel_run_btn", disabled=not (appt_file or labs_file)):
         if not excel_api_key:
             st.error("API 키를 먼저 입력해주세요.")
         else:
@@ -405,15 +451,35 @@ with tab_excel:
             os.environ.pop("USE_UPSTAGE", None)
 
             try:
-                batch_patients = read_excel_patients(excel_file)
+                appt_rows = read_excel_rows(appt_file, APPT_COLUMN_MAP) if appt_file else []
+                labs_rows = read_excel_rows(labs_file, LABS_COLUMN_MAP) if labs_file else []
             except Exception as e:
                 st.error(f"엑셀 형식을 읽는 중 문제가 발생했습니다: {e}")
-                batch_patients = []
+                appt_rows, labs_rows = [], []
 
-            if batch_patients:
+            merged = merge_by_patient_id(appt_rows, labs_rows)
+
+            if not merged:
+                st.warning("매칭할 환자가 없습니다. 엑셀에 환자번호가 비어있지 않은지 확인해주세요.")
+            else:
+                appt_ids = {r["patient_id"] for r in appt_rows}
+                labs_ids = {r["patient_id"] for r in labs_rows}
+                both = appt_ids & labs_ids
+                appt_only = appt_ids - labs_ids
+                labs_only = labs_ids - appt_ids
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("✅ 양쪽 다 매칭", f"{len(both)}명")
+                mc2.metric("📋 외래예약만 있음", f"{len(appt_only)}명")
+                mc3.metric("🧪 검사수치만 있음", f"{len(labs_only)}명")
+                if appt_only or labs_only:
+                    st.caption("한쪽에만 있는 환자는 빠진 정보(예: 검사수치)가 있는 상태로 판정되며, "
+                               "해당 기준은 자동으로 '불확실' 처리되어 직접 확인이 필요합니다.")
+
                 with open(engine.CRITERIA_PATH, encoding="utf-8") as f:
                     criteria_data = json.load(f)
 
+                batch_patients = list(merged.values())
                 progress = st.progress(0, text="일괄 판정 중...")
                 batch_results = []
                 for i, p in enumerate(batch_patients):

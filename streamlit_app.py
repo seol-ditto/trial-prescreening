@@ -79,7 +79,7 @@ patients = data["patients"]
 # ----------------------------------------------------------------------
 # 헤더 + 요약
 # ----------------------------------------------------------------------
-st.title("🏥 내일 방문 예정 환자 프리스크리닝")
+st.title("🏥 방문 예정 환자 프리스크리닝")
 st.caption(f"임상시험: {trial_name}")
 
 n_eligible = sum(1 for p in patients if p["ai_verdict"] == "적격")
@@ -143,6 +143,77 @@ for p in filtered:
                         f"※ AI 프리스크리닝 결과이며 최종 확인 및 동의서 절차는 별도 진행 필요."
                     )
                     st.text_area("📋 교수님께 전달할 메모 (복사해서 사용하세요)", memo, height=120)
+
+st.divider()
+
+# ----------------------------------------------------------------------
+# 새 환자 추가해서 라이브로 AI 판정 받아보기
+# ----------------------------------------------------------------------
+st.subheader("➕ 새 환자 추가해서 AI 판정 받아보기")
+st.caption("직접 환자 정보를 입력하면, 위 임상시험 기준으로 AI가 그 자리에서 적격/보류/부적격을 판정합니다.")
+
+with st.expander("환자 정보 입력하기", expanded=False):
+    new_api_key = st.text_input(
+        "Anthropic API Key (이 판정에만 사용되고 저장되지 않습니다)",
+        type="password",
+        key="new_patient_api_key",
+    )
+
+    with st.form("new_patient_form"):
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            n_id = st.text_input("환자 ID", value="NEW001")
+            n_age = st.number_input("나이", min_value=0, max_value=120, value=65)
+            n_sex = st.selectbox("성별", ["남", "여"])
+        with col_b:
+            n_nyha = st.selectbox("NYHA 기능분류", ["I", "II", "III", "IV"], index=1)
+            n_gdmt = st.number_input("GDMT 복용 주수", min_value=0, value=8)
+            n_egfr = st.number_input("eGFR", min_value=0, value=60)
+        with col_c:
+            n_pregnancy = st.selectbox("임신/수유 여부", ["N/A", "임신 아님", "임신", "수유중"])
+
+        n_echo = st.text_area("심초음파(ECHO) 리포트",
+                               placeholder="예: 2026-08-10 시행. LVEF 32%, 좌심실 확장 소견, 국소벽운동 이상 없음.")
+        n_ekg = st.text_area("심전도(EKG) 소견",
+                              placeholder="예: 정상 동리듬(NSR), 특이 부정맥 소견 없음.")
+        n_mi = st.text_area("최근 심근경색/뇌졸중 병력", placeholder="예: 없음")
+        n_valve = st.text_area("판막질환 소견", placeholder="예: 없음")
+        n_crc_note = st.text_area("CRC 메모",
+                                   placeholder="예: 복약순응도 양호. 최근 체중 증가 없음.")
+
+        submitted = st.form_submit_button("AI 판정 실행")
+
+    if submitted:
+        if not new_api_key:
+            st.error("API 키를 먼저 입력해주세요.")
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = new_api_key
+            os.environ.pop("USE_UPSTAGE", None)
+
+            new_patient = {
+                "patient_id": n_id, "age": n_age, "sex": n_sex, "nyha_class": n_nyha,
+                "gdmt_weeks": n_gdmt, "echo_report": n_echo, "ekg_finding": n_ekg,
+                "recent_mi_stroke": n_mi, "valve_disease": n_valve, "egfr": n_egfr,
+                "pregnancy": n_pregnancy, "crc_note": n_crc_note,
+            }
+            with open(engine.CRITERIA_PATH, encoding="utf-8") as f:
+                criteria_data = json.load(f)
+
+            with st.spinner("AI가 판정 중..."):
+                try:
+                    result = engine.screen_patient(new_patient, criteria_data)
+                except Exception as e:
+                    st.error(f"판정 중 오류가 발생했습니다: {e}")
+                    result = None
+
+            if result:
+                st.markdown(f"### {STATUS_COLOR[result['verdict']]} 판정 결과: {result['verdict']}")
+                for c in result["checks"]:
+                    st.markdown(f"{CHECK_COLOR[c['status']]} **{c['description']}** — {c['status']}")
+                    if c["evidence"]:
+                        st.caption(f"근거: {c['evidence']}")
+                    if c["explanation"]:
+                        st.caption(f"설명: {c['explanation']}")
 
 st.divider()
 st.caption("※ 본 화면은 가상 환자 데이터를 이용한 데모입니다. 실제 환자 데이터는 사용되지 않았습니다.")

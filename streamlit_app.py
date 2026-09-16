@@ -12,7 +12,7 @@ import io
 import json
 import os
 import streamlit as st
-import pandas as pd
+from openpyxl import Workbook, load_workbook
 from pypdf import PdfReader
 
 import screening_engine as engine
@@ -42,34 +42,45 @@ EXCEL_COLUMN_MAP = {
 
 
 def make_excel_template() -> bytes:
-    example = {
-        "환자ID": "P001", "나이": 68, "성별": "남", "NYHA": "III", "GDMT복용주수": 8,
-        "ECHO소견": "2026-08-10 시행. LVEF 32%, 좌심실 확장 소견, 국소벽운동 이상 없음.",
-        "EKG소견": "정상 동리듬(NSR), 특이 부정맥 소견 없음.",
-        "최근MI뇌졸중": "없음", "판막질환": "없음", "eGFR": 55,
-        "임신수유여부": "N/A", "CRC메모": "복약순응도 양호. 지난달 ARNI 증량함.",
-    }
-    df = pd.DataFrame([example])
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "환자목록"
+    ws.append(list(EXCEL_COLUMN_MAP.keys()))
+    ws.append([
+        "P001", 68, "남", "III", 8,
+        "2026-08-10 시행. LVEF 32%, 좌심실 확장 소견, 국소벽운동 이상 없음.",
+        "정상 동리듬(NSR), 특이 부정맥 소견 없음.",
+        "없음", "없음", 55, "N/A", "복약순응도 양호. 지난달 ARNI 증량함.",
+    ])
     buf = io.BytesIO()
-    df.to_excel(buf, index=False)
+    wb.save(buf)
     return buf.getvalue()
 
 
 def read_excel_patients(uploaded_file) -> list:
-    # keep_default_na=False: "N/A"·"없음" 같은 정상 값이 결측치로 오인되어 지워지는 것을 방지
-    df = pd.read_excel(uploaded_file, keep_default_na=False)
-    missing_cols = [c for c in EXCEL_COLUMN_MAP if c not in df.columns]
+    wb = load_workbook(uploaded_file, data_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        raise ValueError("빈 엑셀 파일입니다.")
+
+    header = [str(h).strip() if h is not None else "" for h in rows[0]]
+    missing_cols = [c for c in EXCEL_COLUMN_MAP if c not in header]
     if missing_cols:
         raise ValueError(f"템플릿에 있는 컬럼이 빠져있습니다: {', '.join(missing_cols)}")
+    col_idx = {c: header.index(c) for c in EXCEL_COLUMN_MAP}
 
     patients = []
-    for i, row in df.iterrows():
+    for i, row in enumerate(rows[1:], start=1):
+        if row is None or all(v is None for v in row):
+            continue
         p = {}
         for kr_col, field in EXCEL_COLUMN_MAP.items():
-            val = row[kr_col]
-            p[field] = "" if pd.isna(val) else val
+            idx = col_idx[kr_col]
+            val = row[idx] if idx < len(row) else None
+            p[field] = "" if val is None else val
         if not str(p.get("patient_id") or "").strip():
-            p["patient_id"] = f"EXCEL{i + 1:03d}"
+            p["patient_id"] = f"EXCEL{i:03d}"
         patients.append(p)
     return patients
 

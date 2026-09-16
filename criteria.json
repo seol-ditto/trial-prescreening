@@ -1,0 +1,72 @@
+{
+  "trial_name": "박출률감소 심부전(HFrEF) 환자 대상 신약 병용요법 3상 임상시험",
+  "inclusion_criteria": [
+    {
+      "id": "age",
+      "type": "rule",
+      "field": "age",
+      "description": "만 19세 이상 80세 이하",
+      "check": "19 <= age <= 80"
+    },
+    {
+      "id": "gdmt_duration",
+      "type": "rule",
+      "field": "gdmt_weeks",
+      "description": "표준 심부전 치료제(GDMT)를 최소 4주 이상 안정적으로 복용 중",
+      "check": "gdmt_weeks >= 4"
+    },
+    {
+      "id": "lvef",
+      "type": "llm",
+      "field": "echo_report",
+      "description": "최근 6개월 이내 심초음파(ECHO)상 좌심실박출률(LVEF) 40% 이하로 확인됨"
+    },
+    {
+      "id": "nyha",
+      "type": "rule",
+      "field": "nyha_class",
+      "description": "NYHA 기능분류 II~III",
+      "check": "nyha_class in ['II', 'III']"
+    },
+    {
+      "id": "gdmt_consistency",
+      "type": "llm",
+      "field": "crc_note",
+      "description": "GDMT 복용기간에 대한 CRC 메모 상 진술이 처방기록(gdmt_weeks)과 일치하는지 확인 (진술과 기록이 어긋나면 안정 유지 기간을 신뢰할 수 없으므로 확인 필요)"
+    }
+  ],
+  "exclusion_criteria": [
+    {
+      "id": "recent_mi_stroke",
+      "type": "llm",
+      "field": "recent_mi_stroke",
+      "description": "최근 3개월 이내 급성 심근경색·뇌졸중 병력이 없어야 함"
+    },
+    {
+      "id": "valve_disease",
+      "type": "llm",
+      "field": "valve_disease",
+      "description": "심초음파상 중등도 이상 판막질환이 없어야 함"
+    },
+    {
+      "id": "arrhythmia",
+      "type": "llm",
+      "field": "ekg_finding",
+      "description": "심전도(EKG)상 지속성 심실빈맥 또는 조절되지 않는 심방세동이 없어야 함"
+    },
+    {
+      "id": "renal_function",
+      "type": "rule",
+      "field": "egfr",
+      "description": "신기능 저하(eGFR < 30 mL/min)가 없어야 함",
+      "check": "egfr >= 30"
+    },
+    {
+      "id": "pregnancy",
+      "type": "rule",
+      "field": "pregnancy",
+      "description": "임신 또는 수유 중이 아니어야 함",
+      "check": "pregnancy not in ['임신 8주', '임신', '수유중']"
+    }
+  ]
+}

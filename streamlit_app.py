@@ -8,9 +8,12 @@ CRC 프리스크리닝 자동화 - 데모 화면
 없으면 사이드바에서 API 키를 입력해 그 자리에서 바로 돌릴 수 있게 해뒀다(라이브 데모용).
 """
 
+import io
 import json
 import os
 import streamlit as st
+import pandas as pd
+from pypdf import PdfReader
 
 import screening_engine as engine
 
@@ -18,6 +21,72 @@ st.set_page_config(page_title="프리스크리닝 자동화", layout="wide")
 
 STATUS_COLOR = {"적격": "🟢", "보류": "🟡", "부적격": "⚪"}
 CHECK_COLOR = {"충족": "🟢", "위반": "🔴", "불확실": "🟡"}
+
+# ----------------------------------------------------------------------
+# 엑셀 업로드용 컬럼 매핑 (의무기록팀/PHIS에서 받은 엑셀을 이 템플릿 형식으로 정리해서 올린다고 가정)
+# ----------------------------------------------------------------------
+EXCEL_COLUMN_MAP = {
+    "환자ID": "patient_id",
+    "나이": "age",
+    "성별": "sex",
+    "NYHA": "nyha_class",
+    "GDMT복용주수": "gdmt_weeks",
+    "ECHO소견": "echo_report",
+    "EKG소견": "ekg_finding",
+    "최근MI뇌졸중": "recent_mi_stroke",
+    "판막질환": "valve_disease",
+    "eGFR": "egfr",
+    "임신수유여부": "pregnancy",
+    "CRC메모": "crc_note",
+}
+
+
+def make_excel_template() -> bytes:
+    example = {
+        "환자ID": "P001", "나이": 68, "성별": "남", "NYHA": "III", "GDMT복용주수": 8,
+        "ECHO소견": "2026-08-10 시행. LVEF 32%, 좌심실 확장 소견, 국소벽운동 이상 없음.",
+        "EKG소견": "정상 동리듬(NSR), 특이 부정맥 소견 없음.",
+        "최근MI뇌졸중": "없음", "판막질환": "없음", "eGFR": 55,
+        "임신수유여부": "N/A", "CRC메모": "복약순응도 양호. 지난달 ARNI 증량함.",
+    }
+    df = pd.DataFrame([example])
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False)
+    return buf.getvalue()
+
+
+def read_excel_patients(uploaded_file) -> list:
+    # keep_default_na=False: "N/A"·"없음" 같은 정상 값이 결측치로 오인되어 지워지는 것을 방지
+    df = pd.read_excel(uploaded_file, keep_default_na=False)
+    missing_cols = [c for c in EXCEL_COLUMN_MAP if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"템플릿에 있는 컬럼이 빠져있습니다: {', '.join(missing_cols)}")
+
+    patients = []
+    for i, row in df.iterrows():
+        p = {}
+        for kr_col, field in EXCEL_COLUMN_MAP.items():
+            val = row[kr_col]
+            p[field] = "" if pd.isna(val) else val
+        if not str(p.get("patient_id") or "").strip():
+            p["patient_id"] = f"EXCEL{i + 1:03d}"
+        patients.append(p)
+    return patients
+
+
+def extract_pdf_text(uploaded_file) -> str:
+    reader = PdfReader(uploaded_file)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def render_verdict(result: dict):
+    st.markdown(f"### {STATUS_COLOR[result['verdict']]} 판정 결과: {result['verdict']}")
+    for c in result["checks"]:
+        st.markdown(f"{CHECK_COLOR[c['status']]} **{c['description']}** — {c['status']}")
+        if c["evidence"]:
+            st.caption(f"근거: {c['evidence']}")
+        if c["explanation"]:
+            st.caption(f"설명: {c['explanation']}")
 
 
 # ----------------------------------------------------------------------
@@ -150,9 +219,16 @@ st.divider()
 # 새 환자 추가해서 라이브로 AI 판정 받아보기
 # ----------------------------------------------------------------------
 st.subheader("➕ 새 환자 추가해서 AI 판정 받아보기")
-st.caption("직접 환자 정보를 입력하면, 위 임상시험 기준으로 AI가 그 자리에서 적격/보류/부적격을 판정합니다.")
+st.caption("실무에서 실제로 쓰는 방식 그대로 넣을 수 있게 4가지 입력 방법을 지원합니다.")
 
-with st.expander("환자 정보 입력하기", expanded=False):
+tab_manual, tab_emr, tab_pdf, tab_excel = st.tabs(
+    ["✍️ 직접 입력", "📋 EMR 텍스트 붙여넣기", "📄 판독지 PDF 업로드", "📊 엑셀 일괄 업로드"]
+)
+
+# ------------------------------------------------------------------
+# 1) 직접 입력
+# ------------------------------------------------------------------
+with tab_manual:
     new_api_key = st.text_input(
         "Anthropic API Key (이 판정에만 사용되고 저장되지 않습니다)",
         type="password",
@@ -207,13 +283,150 @@ with st.expander("환자 정보 입력하기", expanded=False):
                     result = None
 
             if result:
-                st.markdown(f"### {STATUS_COLOR[result['verdict']]} 판정 결과: {result['verdict']}")
-                for c in result["checks"]:
-                    st.markdown(f"{CHECK_COLOR[c['status']]} **{c['description']}** — {c['status']}")
-                    if c["evidence"]:
-                        st.caption(f"근거: {c['evidence']}")
-                    if c["explanation"]:
-                        st.caption(f"설명: {c['explanation']}")
+                render_verdict(result)
+
+# ------------------------------------------------------------------
+# 2) EMR/PACS에서 복사한 텍스트 붙여넣기 (PHIS 등에서 복사해온 원문 그대로)
+# ------------------------------------------------------------------
+with tab_emr:
+    st.caption("EMR/PACS에서 복사한 텍스트(인적사항, ECHO·EKG 판독문, 병력, CRC 메모 등)를 그대로 붙여넣으면 "
+               "AI가 항목별로 알아서 정리한 뒤 판정까지 진행합니다. 원문에 없는 값은 임의로 채우지 않습니다.")
+
+    emr_api_key = st.text_input("Anthropic API Key", type="password", key="emr_api_key")
+    emr_raw_text = st.text_area(
+        "EMR/PACS 복사 텍스트", height=220,
+        placeholder="예)\n68세/남, NYHA III\nECHO(2026-08-10): LVEF 32%, 좌심실 확장 소견\nEKG: 정상 동리듬\nCRC 메모: 지난달 ARNI 증량, 복약순응도 양호",
+        key="emr_raw_text",
+    )
+
+    if st.button("AI로 정리 후 판정", key="emr_run_btn"):
+        if not emr_api_key or not emr_raw_text.strip():
+            st.error("API 키와 텍스트를 모두 입력해주세요.")
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = emr_api_key
+            os.environ.pop("USE_UPSTAGE", None)
+
+            with st.spinner("AI가 텍스트에서 환자 정보를 추출하는 중..."):
+                extracted = engine.extract_patient_from_text(emr_raw_text)
+
+            st.markdown("**추출된 환자 정보** (원문에 없는 항목은 `null`로 남고, 해당 기준은 '불확실'로 처리됩니다)")
+            st.json(extracted)
+
+            with open(engine.CRITERIA_PATH, encoding="utf-8") as f:
+                criteria_data = json.load(f)
+            with st.spinner("AI가 판정 중..."):
+                try:
+                    result = engine.screen_patient(extracted, criteria_data)
+                except Exception as e:
+                    st.error(f"판정 중 오류가 발생했습니다: {e}")
+                    result = None
+            if result:
+                render_verdict(result)
+
+# ------------------------------------------------------------------
+# 3) 판독지 PDF 업로드 (ECHO 리포트가 PDF로 저장되는 경우)
+# ------------------------------------------------------------------
+with tab_pdf:
+    st.caption("ECHO 등 판독지를 PDF로 저장해뒀다면 그대로 업로드하세요. 텍스트를 추출해 AI가 항목을 정리하고 판정합니다. "
+               "(스캔 이미지형 PDF는 텍스트 추출이 안 될 수 있습니다 - 텍스트 기반 PDF만 지원)")
+
+    pdf_api_key = st.text_input("Anthropic API Key", type="password", key="pdf_api_key")
+    pdf_file = st.file_uploader("판독지 PDF 업로드", type=["pdf"], key="pdf_uploader")
+    pdf_extra_note = st.text_area("추가로 넣을 정보(선택) - 나이/NYHA/CRC 메모 등 PDF에 없는 내용",
+                                   placeholder="예: 74세 여, NYHA II, GDMT 12주째 복용 중", key="pdf_extra_note")
+
+    if st.button("PDF에서 추출 후 판정", key="pdf_run_btn"):
+        if not pdf_api_key or not pdf_file:
+            st.error("API 키와 PDF 파일을 모두 넣어주세요.")
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = pdf_api_key
+            os.environ.pop("USE_UPSTAGE", None)
+
+            with st.spinner("PDF에서 텍스트 추출 중..."):
+                pdf_text = extract_pdf_text(pdf_file)
+
+            if not pdf_text.strip():
+                st.error("PDF에서 텍스트를 추출하지 못했습니다. 스캔 이미지형 PDF일 수 있습니다.")
+            else:
+                with st.expander("추출된 PDF 원문 텍스트 보기"):
+                    st.text(pdf_text)
+
+                combined_text = pdf_text + ("\n\n" + pdf_extra_note if pdf_extra_note.strip() else "")
+                with st.spinner("AI가 텍스트에서 환자 정보를 추출하는 중..."):
+                    extracted = engine.extract_patient_from_text(combined_text)
+
+                st.markdown("**추출된 환자 정보**")
+                st.json(extracted)
+
+                with open(engine.CRITERIA_PATH, encoding="utf-8") as f:
+                    criteria_data = json.load(f)
+                with st.spinner("AI가 판정 중..."):
+                    try:
+                        result = engine.screen_patient(extracted, criteria_data)
+                    except Exception as e:
+                        st.error(f"판정 중 오류가 발생했습니다: {e}")
+                        result = None
+                if result:
+                    render_verdict(result)
+
+# ------------------------------------------------------------------
+# 4) 엑셀 일괄 업로드 (의무기록팀/PHIS에서 엑셀로 받은 환자 목록)
+# ------------------------------------------------------------------
+with tab_excel:
+    st.caption("의무기록팀에 요청한 검사결과, PHIS 외래 예약 환자 리스트처럼 엑셀로 받은 자료를 "
+               "아래 템플릿 형식에 맞춰 정리한 뒤 업로드하면 여러 명을 한 번에 판정합니다.")
+
+    st.download_button(
+        "📥 엑셀 템플릿 다운로드",
+        data=make_excel_template(),
+        file_name="환자목록_템플릿.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    excel_api_key = st.text_input("Anthropic API Key", type="password", key="excel_api_key")
+    excel_file = st.file_uploader("환자 목록 엑셀 업로드 (.xlsx)", type=["xlsx"], key="excel_uploader")
+
+    if st.button("일괄 AI 판정 실행", key="excel_run_btn", disabled=not excel_file):
+        if not excel_api_key:
+            st.error("API 키를 먼저 입력해주세요.")
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = excel_api_key
+            os.environ.pop("USE_UPSTAGE", None)
+
+            try:
+                batch_patients = read_excel_patients(excel_file)
+            except Exception as e:
+                st.error(f"엑셀 형식을 읽는 중 문제가 발생했습니다: {e}")
+                batch_patients = []
+
+            if batch_patients:
+                with open(engine.CRITERIA_PATH, encoding="utf-8") as f:
+                    criteria_data = json.load(f)
+
+                progress = st.progress(0, text="일괄 판정 중...")
+                batch_results = []
+                for i, p in enumerate(batch_patients):
+                    r = engine.screen_patient(p, criteria_data)
+                    batch_results.append({**p, "ai_verdict": r["verdict"], "checks": r["checks"]})
+                    progress.progress((i + 1) / len(batch_patients),
+                                       text=f"{p.get('patient_id')} 처리 중... ({i + 1}/{len(batch_patients)})")
+                progress.empty()
+
+                st.success(f"{len(batch_results)}명 판정 완료")
+                eb1, eb2, eb3 = st.columns(3)
+                eb1.metric("🟢 적격", sum(1 for p in batch_results if p["ai_verdict"] == "적격"))
+                eb2.metric("🟡 보류", sum(1 for p in batch_results if p["ai_verdict"] == "보류"))
+                eb3.metric("⚪ 부적격", sum(1 for p in batch_results if p["ai_verdict"] == "부적격"))
+
+                for p in batch_results:
+                    with st.container(border=True):
+                        st.markdown(f"{STATUS_COLOR[p['ai_verdict']]} **{p.get('patient_id')}** — {p['ai_verdict']}")
+                        uncertain_or_failed = [c for c in p["checks"] if c["status"] != "충족"]
+                        if uncertain_or_failed:
+                            st.caption(" · ".join(f"{c['description']} → {c['status']}"
+                                                   for c in uncertain_or_failed[:2]))
+                        else:
+                            st.caption("모든 기준 충족")
 
 st.divider()
 st.caption("※ 본 화면은 가상 환자 데이터를 이용한 데모입니다. 실제 환자 데이터는 사용되지 않았습니다.")
